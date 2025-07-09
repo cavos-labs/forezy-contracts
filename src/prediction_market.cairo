@@ -8,10 +8,11 @@ pub mod PredictionMarket {
     use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
 
     use super::super::interfaces::{IPredictionMarket, Market};
-    use super::super::events::{Deposit, Withdraw, MarketCreated, SharesBought, MarketResolved, WinningsClaimed};
+    use super::super::events::{Deposit, DepositFeeCollected, Withdraw, MarketCreated, BetPlaced, MarketResolved, WinningsClaimed};
     use super::super::utils::{
-        calculate_constant_product_price, calculate_shares_from_amount, calculate_winnings,
-        is_market_active, is_market_resolved, can_resolve_market
+        calculate_outcome_percentage, calculate_winnings_from_bet,
+        is_market_active, is_market_resolved, can_resolve_market,
+        calculate_fee, calculate_net_amount, DEPOSIT_FEE_BASIS_POINTS
     };
 
     #[storage]
@@ -22,6 +23,9 @@ pub mod PredictionMarket {
         // Contract owner
         owner: ContractAddress,
         
+        // Maintenance contract for fee collection
+        maintenance_contract: ContractAddress,
+        
         // User balances (address => amount)
         user_balances: Map<ContractAddress, u256>,
         
@@ -31,20 +35,26 @@ pub mod PredictionMarket {
         // Market count for generating unique IDs
         market_count: u256,
         
-        // User share holdings (user => market_id => is_outcome_a => shares)
-        user_shares: Map<(ContractAddress, u256, bool), u256>,
+        // User bet amounts (user => market_id => is_outcome_a => bet_amount)
+        user_bets: Map<(ContractAddress, u256, bool), u256>,
         
         // Track which users have claimed winnings for each market
         winnings_claimed: Map<(ContractAddress, u256), bool>,
+
+        // Total bet amounts for each outcome (market_id => outcome => total_bets)
+        total_bets_a: Map<u256, u256>,
+        total_bets_b: Map<u256, u256>,
+        
     }
 
     #[event]
     #[derive(Drop, starknet::Event)]
     pub enum Event {
         Deposit: Deposit,
+        DepositFeeCollected: DepositFeeCollected,
         Withdraw: Withdraw,
         MarketCreated: MarketCreated,
-        SharesBought: SharesBought,
+        BetPlaced: BetPlaced,
         MarketResolved: MarketResolved,
         WinningsClaimed: WinningsClaimed,
     }
@@ -53,10 +63,12 @@ pub mod PredictionMarket {
     fn constructor(
         ref self: ContractState,
         token_address: ContractAddress,
-        owner: ContractAddress
+        maintenance_contract: ContractAddress,
     ) {
+        let caller = get_caller_address();
         self.token_address.write(token_address);
-        self.owner.write(owner);
+        self.maintenance_contract.write(maintenance_contract);
+        self.owner.write(caller);
         self.market_count.write(0);
     }
 
@@ -67,22 +79,44 @@ pub mod PredictionMarket {
             
             let caller = get_caller_address();
             let token = IERC20Dispatcher { contract_address: self.token_address.read() };
+            let maintenance_contract = self.maintenance_contract.read();
             
-            // Transfer tokens from user to contract
+            // Calculate fee (1%) and net amount (99%)
+            let fee_amount = calculate_fee(amount, DEPOSIT_FEE_BASIS_POINTS);
+            let net_amount = calculate_net_amount(amount, DEPOSIT_FEE_BASIS_POINTS);
+            
+            // Transfer full amount from user to this contract
             let success = token.transfer_from(caller, get_contract_address(), amount);
             assert(success, 'Token transfer failed');
             
-            // Update user balance
+            // Transfer fee to maintenance contract
+            if fee_amount > 0 && maintenance_contract != get_contract_address() {
+                let fee_transfer_success = token.transfer(maintenance_contract, fee_amount);
+                assert(fee_transfer_success, 'Fee transfer failed');
+            }
+            
+            // Update user balance with net amount (after fee deduction)
             let current_balance = self.user_balances.entry(caller).read();
-            let new_balance = current_balance + amount;
+            let new_balance = current_balance + net_amount;
             self.user_balances.entry(caller).write(new_balance);
             
-            // Emit event
+            // Emit deposit event
             self.emit(Event::Deposit(Deposit {
                 user: caller,
-                amount,
+                amount: net_amount, // Amount credited to user's balance
                 new_balance
             }));
+            
+            // Emit fee collection event
+            if fee_amount > 0 {
+                self.emit(Event::DepositFeeCollected(DepositFeeCollected {
+                    user: caller,
+                    gross_amount: amount,
+                    fee_amount,
+                    net_amount,
+                    maintenance_contract
+                }));
+            }
         }
 
         fn withdraw(ref self: ContractState, amount: u256) {
@@ -115,22 +149,13 @@ pub mod PredictionMarket {
 
         fn create_market(
             ref self: ContractState,
-            title: ByteArray,
-            description: ByteArray,
-            outcome_a_text: ByteArray,
-            outcome_b_text: ByteArray,
             resolution_time: u64,
             initial_liquidity: u256
         ) -> u256 {
-            // Only owner can create markets
+
             let caller = get_caller_address();
-            assert(caller == self.owner.read(), 'Caller is not the owner');
-            
-            assert(initial_liquidity > 0, 'Initial liquidity must be > 0');
+
             assert(resolution_time > get_block_timestamp(), 'Invalid resolution time');
-            
-            let current_balance = self.user_balances.entry(caller).read();
-            assert(current_balance >= initial_liquidity, 'Insufficient balance');
             
             // Generate new market ID
             let market_id = self.market_count.read() + 1;
@@ -139,34 +164,22 @@ pub mod PredictionMarket {
             // Create market struct
             let market = Market {
                 id: market_id,
-                title: title.clone(),
-                description: description.clone(),
-                outcome_a_text: outcome_a_text.clone(),
-                outcome_b_text: outcome_b_text.clone(),
                 resolution_time,
                 resolved_outcome: 0, // 0 = unresolved
                 creator: caller,
-                total_liquidity: initial_liquidity,
-                total_shares_a: initial_liquidity / 2, // Start with 50/50 split
-                total_shares_b: initial_liquidity / 2,
+                total_liquidity: 0,
+                total_percentage_a: 0, // Start with 0% for both outcomes
+                total_percentage_b: 0,
                 created_at: get_block_timestamp(),
             };
             
             // Store market
             self.markets.entry(market_id).write(market);
             
-            // Deduct liquidity from creator's balance
-            let new_balance = current_balance - initial_liquidity;
-            self.user_balances.entry(caller).write(new_balance);
-            
             // Emit event
             self.emit(Event::MarketCreated(MarketCreated {
                 market_id,
                 creator: caller,
-                title,
-                description,
-                outcome_a_text,
-                outcome_b_text,
                 resolution_time,
                 initial_liquidity
             }));
@@ -175,7 +188,9 @@ pub mod PredictionMarket {
         }
 
         fn get_market_details(self: @ContractState, market_id: u256) -> Market {
-            self.markets.entry(market_id).read()
+            let market = self.markets.entry(market_id).read();
+            assert(market.id != 0, 'Market does not exist');
+            market
         }
 
         fn get_all_market_ids(self: @ContractState) -> Array<u256> {
@@ -193,17 +208,17 @@ pub mod PredictionMarket {
             self.market_count.read()
         }
 
-        fn buy_shares(
+        fn place_bet(
             ref self: ContractState, 
             market_id: u256, 
             is_outcome_a: bool, 
-            amount_to_spend: u256
-        ) -> u256 {
-            assert(amount_to_spend > 0, 'Amount must be greater than 0');
+            amount: u256
+        ) {
+            assert(amount > 0, 'Amount must be greater than 0');
             
             let caller = get_caller_address();
             let current_balance = self.user_balances.entry(caller).read();
-            assert(current_balance >= amount_to_spend, 'Insufficient balance');
+            assert(current_balance >= amount, 'Insufficient balance');
             
             // Get market details
             let mut market = self.markets.entry(market_id).read();
@@ -213,94 +228,74 @@ pub mod PredictionMarket {
             let current_time = get_block_timestamp();
             assert(is_market_active(market.resolution_time, current_time, market.resolved_outcome), 'Market not active');
             
-            // Calculate shares to receive using AMM formula
-            let shares_received = calculate_shares_from_amount(
-                market.total_shares_a,
-                market.total_shares_b,
-                amount_to_spend,
-                is_outcome_a
-            );
-            
-            assert(shares_received > 0, 'Invalid share calculation');
-            
-            // Update market state
-            if is_outcome_a {
-                market.total_shares_a = market.total_shares_a + shares_received;
-            } else {
-                market.total_shares_b = market.total_shares_b + shares_received;
-            }
-            market.total_liquidity = market.total_liquidity + amount_to_spend;
-            
             // Update user balance
-            let new_balance = current_balance - amount_to_spend;
+            let new_balance = current_balance - amount;
             self.user_balances.entry(caller).write(new_balance);
             
-            // Update user shares
-            let current_shares = self.user_shares.entry((caller, market_id, is_outcome_a)).read();
-            self.user_shares.entry((caller, market_id, is_outcome_a)).write(current_shares + shares_received);
+            // Update user bet
+            let current_bet = self.user_bets.entry((caller, market_id, is_outcome_a)).read();
+            self.user_bets.entry((caller, market_id, is_outcome_a)).write(current_bet + amount);
             
-            // Calculate new price for event before storing market
-            let new_price = calculate_constant_product_price(
-                market.total_shares_a,
-                market.total_shares_b,
-                is_outcome_a
-            );
+            // Update total bets for the outcome
+            if is_outcome_a {
+                let current_total_a = self.total_bets_a.entry(market_id).read();
+                self.total_bets_a.entry(market_id).write(current_total_a + amount);
+            } else {
+                let current_total_b = self.total_bets_b.entry(market_id).read();
+                self.total_bets_b.entry(market_id).write(current_total_b + amount);
+            }
+            
+            // Update market liquidity
+            market.total_liquidity = market.total_liquidity + amount;
+            
+            // Calculate new percentages in basis points
+            let total_a = self.total_bets_a.entry(market_id).read();
+            let total_b = self.total_bets_b.entry(market_id).read();
+            
+            market.total_percentage_a = calculate_outcome_percentage(total_a, market.total_liquidity);
+            market.total_percentage_b = calculate_outcome_percentage(total_b, market.total_liquidity);
             
             // Store updated market
             self.markets.entry(market_id).write(market);
             
             // Emit event
-            self.emit(Event::SharesBought(SharesBought {
+            self.emit(Event::BetPlaced(BetPlaced {
                 user: caller,
                 market_id,
                 is_outcome_a,
-                amount_spent: amount_to_spend,
-                shares_received,
-                new_price
+                bet_amount: amount,
+                new_percentage_a: market.total_percentage_a,
+                new_percentage_b: market.total_percentage_b,
+                total_liquidity: market.total_liquidity,
             }));
-            
-            shares_received
         }
 
-        fn get_share_price(self: @ContractState, market_id: u256, is_outcome_a: bool) -> u256 {
+        fn get_market_percentages(self: @ContractState, market_id: u256) -> (u256, u256) {
             let market = self.markets.entry(market_id).read();
             assert(market.id != 0, 'Market does not exist');
             
-            calculate_constant_product_price(
-                market.total_shares_a,
-                market.total_shares_b,
-                is_outcome_a
-            )
+            (market.total_percentage_a, market.total_percentage_b)
         }
 
-        fn calculate_shares_for_amount(
-            self: @ContractState,
-            market_id: u256,
-            is_outcome_a: bool,
-            amount: u256
-        ) -> u256 {
-            let market = self.markets.entry(market_id).read();
-            assert(market.id != 0, 'Market does not exist');
-            
-            calculate_shares_from_amount(
-                market.total_shares_a,
-                market.total_shares_b,
-                amount,
-                is_outcome_a
-            )
-        }
-
-        fn get_user_shares(
+        fn get_user_bet(
             self: @ContractState,
             user: ContractAddress,
             market_id: u256,
             is_outcome_a: bool
         ) -> u256 {
-            self.user_shares.entry((user, market_id, is_outcome_a)).read()
+            self.user_bets.entry((user, market_id, is_outcome_a)).read()
+        }
+
+        fn get_total_bets_for_outcome(self: @ContractState, market_id: u256, is_outcome_a: bool) -> u256 {
+            if is_outcome_a {
+                self.total_bets_a.entry(market_id).read()
+            } else {
+                self.total_bets_b.entry(market_id).read()
+            }
         }
 
         fn resolve_market(ref self: ContractState, market_id: u256, winning_outcome_is_a: bool) {
-            // Only owner can resolve markets
+            // Only owner can resolve markets (Ideally this would be with an oracle)
             let caller = get_caller_address();
             assert(caller == self.owner.read(), 'Caller is not the owner');
             
@@ -336,20 +331,20 @@ pub mod PredictionMarket {
             // Determine winning outcome
             let winning_outcome_is_a = market.resolved_outcome == 1;
             
-            // Get user's shares in winning outcome
-            let user_winning_shares = self.user_shares.entry((caller, market_id, winning_outcome_is_a)).read();
-            assert(user_winning_shares > 0, 'No winning shares to claim');
+            // Get user's bet on winning outcome
+            let user_winning_bet = self.user_bets.entry((caller, market_id, winning_outcome_is_a)).read();
+            assert(user_winning_bet > 0, 'No winning bet to claim');
             
             // Calculate winnings
-            let total_winning_shares = if winning_outcome_is_a {
-                market.total_shares_a
+            let total_winning_bets = if winning_outcome_is_a {
+                self.total_bets_a.entry(market_id).read()
             } else {
-                market.total_shares_b
+                self.total_bets_b.entry(market_id).read()
             };
             
-            let winnings = calculate_winnings(
-                user_winning_shares,
-                total_winning_shares,
+            let winnings = calculate_winnings_from_bet(
+                user_winning_bet,
+                total_winning_bets,
                 market.total_liquidity
             );
             
@@ -365,7 +360,7 @@ pub mod PredictionMarket {
                 user: caller,
                 market_id,
                 winnings_amount: winnings,
-                shares_held: user_winning_shares
+                bet_amount: user_winning_bet
             }));
             
             winnings
@@ -373,6 +368,22 @@ pub mod PredictionMarket {
 
         fn get_token_address(self: @ContractState) -> ContractAddress {
             self.token_address.read()
+        }
+
+        fn get_maintenance_contract(self: @ContractState) -> ContractAddress {
+            self.maintenance_contract.read()
+        }
+
+        fn set_maintenance_contract(ref self: ContractState, new_maintenance_contract: ContractAddress) {
+            // Only owner can change maintenance contract
+            let caller = get_caller_address();
+            assert(caller == self.owner.read(), 'Caller is not the owner');
+            
+            self.maintenance_contract.write(new_maintenance_contract);
+        }
+
+        fn get_owner(self: @ContractState) -> ContractAddress {
+            self.owner.read()
         }
     }
 } 
