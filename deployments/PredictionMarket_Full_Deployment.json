@@ -1,13 +1,13 @@
 {
   "contractName": "PredictionMarket",
-  "classHash": "0x7aa2ff7531fe70b3d8745cbbcd5a26928e8020741b01e3de0530de1a16bb27f",
-  "contractAddress": "0x526ded536466795c08fcffcd7be676691e3ac22f47578b502dad65a8d9491a2",
-  "declareTransactionHash": "0x22cd5f7d1072d7a1b6162233a9566e3b276c926d6fc3e37c1a06f09658a75b7",
-  "deployTransactionHash": "0x61b566588d9e0ad7540a436d5c050477b41149b995f0ae6f68bf2be4c8dea10",
+  "classHash": "0x71bb88e1e1b905c6b0dbffd68c3bfbc972d5e2c720d6c0f40fafb4efd566187",
+  "contractAddress": "0x1f1bcb50b61e9b0aa7ac6a50ec7769be95c475f8fe913d0370c3f114aa52a7c",
+  "declareTransactionHash": "0x63ee0a3970ff4407cc33f3d091bd752088d1ae3a1a75b1c062ac252f353ea22",
+  "deployTransactionHash": "0x2e48c10d22d45039c13f0326160729341e393edcded9b9e14a98518cba4dfcf",
   "constructorCalldata": [
     "0x06629d822213166aF3c08dFc6897E3534e3683e0F65285417a7d506Cd6A893a7",
     "0x04718f5a0Fc34cC1AF16A1cdee98fFB20C31f5cD61D6Ab07201858f4287c938D"
   ],
-  "timestamp": "2025-06-26T06:36:18.163Z",
+  "timestamp": "2025-06-26T22:00:29.606Z",
   "network": "sepolia"
 }

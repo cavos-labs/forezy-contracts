@@ -10,10 +10,6 @@ pub trait IPredictionMarket<TContractState> {
     // Market creation and management
     fn create_market(
         ref self: TContractState,
-        title: ByteArray,
-        description: ByteArray,
-        outcome_a_text: ByteArray,
-        outcome_b_text: ByteArray,
         resolution_time: u64,
         initial_liquidity: u256
     ) -> u256;
@@ -23,11 +19,11 @@ pub trait IPredictionMarket<TContractState> {
     fn get_all_market_ids(self: @TContractState) -> Array<u256>;
     fn get_market_count(self: @TContractState) -> u256;
     
-    // Share trading
-    fn buy_shares(ref self: TContractState, market_id: u256, is_outcome_a: bool, amount_to_spend: u256) -> u256;
-    fn get_share_price(self: @TContractState, market_id: u256, is_outcome_a: bool) -> u256;
-    fn calculate_shares_for_amount(self: @TContractState, market_id: u256, is_outcome_a: bool, amount: u256) -> u256;
-    fn get_user_shares(self: @TContractState, user: ContractAddress, market_id: u256, is_outcome_a: bool) -> u256;
+    // Betting functions (replacing share trading)
+    fn place_bet(ref self: TContractState, market_id: u256, is_outcome_a: bool, amount: u256);
+    fn get_market_percentages(self: @TContractState, market_id: u256) -> (u256, u256); // Returns (percentage_a, percentage_b) in basis points
+    fn get_user_bet(self: @TContractState, user: ContractAddress, market_id: u256, is_outcome_a: bool) -> u256;
+    fn get_total_bets_for_outcome(self: @TContractState, market_id: u256, is_outcome_a: bool) -> u256;
     
     // Market resolution
     fn resolve_market(ref self: TContractState, market_id: u256, winning_outcome_is_a: bool);
@@ -35,20 +31,19 @@ pub trait IPredictionMarket<TContractState> {
     
     // Utility functions
     fn get_token_address(self: @TContractState) -> ContractAddress;
+    fn get_maintenance_contract(self: @TContractState) -> ContractAddress;
+    fn set_maintenance_contract(ref self: TContractState, new_maintenance_contract: ContractAddress);
+    fn get_owner(self: @TContractState) -> ContractAddress;
 }
 
-#[derive(Drop, Serde, starknet::Store)]
+#[derive(Copy, Drop, Serde, starknet::Store)]
 pub struct Market {
     pub id: u256,
-    pub title: ByteArray,
-    pub description: ByteArray,
-    pub outcome_a_text: ByteArray,
-    pub outcome_b_text: ByteArray,
     pub resolution_time: u64,
     pub resolved_outcome: u8, // 0 = unresolved, 1 = outcome A, 2 = outcome B
     pub creator: ContractAddress,
     pub total_liquidity: u256,
-    pub total_shares_a: u256,
-    pub total_shares_b: u256,
+    pub total_percentage_a: u256, // Percentage in basis points (10000 = 100%)
+    pub total_percentage_b: u256, // Percentage in basis points (10000 = 100%)
     pub created_at: u64,
 } 
